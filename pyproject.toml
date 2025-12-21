@@ -1,0 +1,26 @@
+[project]
+name = "diffusion-continuum-mpc"
+version = "0.1.0"
+description = "Diffusion-MPC for 3-segment continuum arm kinematics (trajectory chunks)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch",
+  "diffusers",
+  "accelerate",
+  "numpy",
+  "tqdm",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff",
+  "mypy",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
