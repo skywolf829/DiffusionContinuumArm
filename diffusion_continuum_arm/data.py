@@ -7,7 +7,7 @@ from typing import Dict, Tuple
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
-
+from continuum_kinematics_torch import continuum_fk_points as fk_points
 from model import AngleSpec, decode_phi
 
 
@@ -39,55 +39,6 @@ class GenSpec:
     # collision softness
     coll_sigma: float = 0.02
     arm_radius: float = 0.02
-
-
-# -----------------------------
-# Toy FK (replace with continuum FK!)
-# -----------------------------
-def toy_fk_points(x_phys: torch.Tensor, link_lengths=(0.35, 0.30, 0.25), points_per_segment: int = 10) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    x_phys: (B, T, 6) [theta1,phi1, theta2,phi2, theta3,phi3]
-    Returns:
-      points: (B, T, P, 3) sampled points along the chain
-      tip:    (B, T, 3)
-    A simple 3-link chain in 3D:
-      Each segment direction is a unit vector from spherical angles (theta,phi),
-      and the chain is built by summing link vectors in world coordinates.
-    """
-    B, T, _ = x_phys.shape
-    device = x_phys.device
-    dtype = x_phys.dtype
-
-    thetas = torch.stack([x_phys[..., 0], x_phys[..., 2], x_phys[..., 4]], dim=-1)  # (B,T,3)
-    phis   = torch.stack([x_phys[..., 1], x_phys[..., 3], x_phys[..., 5]], dim=-1)  # (B,T,3)
-
-    # direction from spherical angles:
-    # using theta as inclination, phi as azimuth (common convention)
-    dx = torch.sin(thetas) * torch.cos(phis)
-    dy = torch.sin(thetas) * torch.sin(phis)
-    dz = torch.cos(thetas)
-    dirs = torch.stack([dx, dy, dz], dim=-1)  # (B,T,3,3)
-
-    # build segment endpoints
-    origin = torch.zeros((B, T, 3), device=device, dtype=dtype)
-    p0 = origin
-    points_list = []
-
-    curr = p0
-    for si, L in enumerate(link_lengths):
-        d = dirs[:, :, si, :]  # (B,T,3)
-        end = curr + L * d
-
-        # sample along segment
-        alphas = torch.linspace(0.0, 1.0, points_per_segment, device=device, dtype=dtype).view(1, 1, -1, 1)
-        seg_pts = curr.unsqueeze(2) * (1 - alphas) + end.unsqueeze(2) * alphas  # (B,T,Pseg,3)
-        points_list.append(seg_pts)
-
-        curr = end
-
-    points = torch.cat(points_list, dim=2)  # (B,T,P,3)
-    tip = curr  # (B,T,3)
-    return points, tip
 
 
 def collision_loss_spheres(points: torch.Tensor, spheres: torch.Tensor, arm_radius: float, sigma: float) -> torch.Tensor:
@@ -259,7 +210,7 @@ def repair_trajectory(
         x_lat = integrate_latents(x0_latent, d_clamped)
         x_phys = decode_latent_to_phys(x_lat, angle_spec)
 
-        points, tip = toy_fk_points(x_phys, points_per_segment=gen.points_per_segment)
+        points, tip = fk_points(x_phys, points_per_segment=gen.points_per_segment)
 
         # goal terms
         d_tip = torch.linalg.norm(tip - goal_xyz.unsqueeze(1), dim=-1)  # (B,H)
@@ -326,7 +277,7 @@ class TrajectoryChunkDataset(Dataset):
         d_nom = nominal_deltas(1, self.gen_spec.horizon, self.angle_spec, self.device)
         x_nom_lat = integrate_latents(x0, d_nom)
         x_nom_phys = decode_latent_to_phys(x_nom_lat, self.angle_spec)
-        pts_nom, tip_nom = toy_fk_points(x_nom_phys, points_per_segment=self.gen_spec.points_per_segment)
+        pts_nom, tip_nom = fk_points(x_nom_phys, points_per_segment=self.gen_spec.points_per_segment)
 
         spheres = make_obstacles_adversarial(pts_nom, tip_nom, self.obs_spec, collide_prob=0.75)
 

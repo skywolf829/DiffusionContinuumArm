@@ -19,7 +19,7 @@ from data import (
     nominal_deltas,
     integrate_latents,
     decode_latent_to_phys,
-    toy_fk_points,
+    fk_points,
     collision_loss_spheres,
     make_obstacles_adversarial,
 )
@@ -52,7 +52,7 @@ def score_chunks(
     """
     x_lat = integrate_latents(x0_latent, deltas)
     x_phys = decode_latent_to_phys(x_lat, angle_spec)
-    points, tip = toy_fk_points(x_phys, points_per_segment=gen.points_per_segment)
+    points, tip = fk_points(x_phys, points_per_segment=gen.points_per_segment)
 
     # goal
     d_tip = torch.linalg.norm(tip - goal_xyz.unsqueeze(1), dim=-1)  # (B,H)
@@ -194,7 +194,7 @@ def main():
     d_nom = nominal_deltas(1, gen.horizon, angle, device)
     x_nom_lat = integrate_latents(x0_latent, d_nom)
     x_nom_phys = decode_latent_to_phys(x_nom_lat, angle)
-    pts_nom, tip_nom = toy_fk_points(x_nom_phys, points_per_segment=gen.points_per_segment)
+    pts_nom, tip_nom = fk_points(x_nom_phys, points_per_segment=gen.points_per_segment)
     spheres = make_obstacles_adversarial(pts_nom, tip_nom, obs_spec, collide_prob=0.75)
 
     # MPC loop
@@ -202,7 +202,7 @@ def main():
     for it in tqdm(range(args.mpc_steps)):
         # Check stop condition
         x0_phys = decode_latent_to_phys(x0_latent.unsqueeze(0), angle)  # (1,1,6) hacky
-        _, tip0 = toy_fk_points(x0_phys, points_per_segment=gen.points_per_segment)
+        _, tip0 = fk_points(x0_phys, points_per_segment=gen.points_per_segment)
         dist0 = torch.linalg.norm(tip0[:, -1, :] - goal_xyz, dim=-1).item()
 
         if dist0 < args.goal_eps:
