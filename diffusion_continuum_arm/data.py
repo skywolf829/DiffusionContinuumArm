@@ -27,7 +27,8 @@ class GenSpec:
     horizon: int = 20
     # number of points sampled along the arm for collision checking
     points_per_segment: int = 10
-    # "repair" optimizer steps
+    # NOTE: legacy fields from the old "repair" optimizer approach.
+    # They are unused in the random-walk data generator (kept for CLI/backward-compat).
     repair_steps: int = 120
     repair_lr: float = 0.05
     # weights
@@ -175,80 +176,112 @@ def decode_latent_to_phys(x_latent: torch.Tensor, angle_spec: AngleSpec) -> torc
     return x
 
 
-def repair_trajectory(
-    x0_latent: torch.Tensor,
-    goal_xyz: torch.Tensor,
-    spheres: torch.Tensor,
-    angle_spec: AngleSpec,
-    gen: GenSpec,
+
+
+# ----------------- New helpers for random-walk data generation -----------------
+
+def min_clearance_to_spheres(points: torch.Tensor, spheres: torch.Tensor, arm_radius: float) -> torch.Tensor:
+    """Compute minimum clearance between a swept set of points and a batch of spheres.
+
+    points:  (B,T,P,3)
+    spheres: (B,O,4) [cx,cy,cz,r]
+
+    Returns:
+        min_clearance: (B,O) minimum over (T,P) of dist - (r + arm_radius)
+    """
+    c = spheres[..., :3]  # (B,O,3)
+    r = spheres[..., 3]   # (B,O)
+
+    diff = points.unsqueeze(3) - c.unsqueeze(1).unsqueeze(1)    # (B,T,P,O,3)
+    dist = torch.linalg.norm(diff, dim=-1)                      # (B,T,P,O)
+    clearance = dist - (r.unsqueeze(1).unsqueeze(1) + arm_radius)
+    return clearance.amin(dim=(1, 2))                            # (B,O)
+
+
+def sample_nonintersecting_spheres(
+    points: torch.Tensor,
+    obs_spec: ObstacleSpec,
+    arm_radius: float,
+    margin: float = 0.01,
+    max_tries: int = 200,
 ) -> torch.Tensor:
+    """Sample spheres that do NOT intersect the arm sweep.
+
+    Strategy: rejection sample each sphere center/radius until min clearance > margin.
+
+    points: (B,T,P,3)
+    Returns: spheres (B,max_obs,4)
     """
-    Optimize deltas to be smooth, reach goal, and avoid spheres.
-    Returns deltas_latent: (B,H,6)
+    B, T, P, _ = points.shape
+    device = points.device
+    dtype = points.dtype
+
+    spheres = torch.zeros((B, obs_spec.max_obs, 4), device=device, dtype=dtype)
+
+    for b in range(B):
+        placed = 0
+        tries = 0
+        while placed < obs_spec.max_obs and tries < max_tries:
+            tries += 1
+
+            r = torch.empty((), device=device, dtype=dtype).uniform_(obs_spec.r_min, obs_spec.r_max)
+            c = torch.empty((3,), device=device, dtype=dtype).uniform_(obs_spec.c_min, obs_spec.c_max)
+
+            cand = torch.zeros((1, 1, 4), device=device, dtype=dtype)
+            cand[0, 0, :3] = c
+            cand[0, 0, 3] = r
+
+            # (1,1) min clearance vs this candidate
+            mc = min_clearance_to_spheres(points[b : b + 1], cand, arm_radius=arm_radius)[0, 0]
+            if mc > margin:
+                spheres[b, placed, :3] = c
+                spheres[b, placed, 3] = r
+                placed += 1
+
+        # If we fail to place all spheres, remaining ones stay zeros.
+        # That's OK; collision loss treats r=0 spheres as near-no-op.
+
+    return spheres
+
+
+def random_walk_deltas(
+    B: int,
+    H: int,
+    angle_spec: AngleSpec,
+    device: torch.device,
+    step_sigma: float = 0.04,
+    smooth_kernel: int = 5,
+) -> torch.Tensor:
+    """Fast random-walk delta generator (no inner optimization).
+
+    Produces deltas: (B,H,6) with simple temporal smoothing + rate limits.
     """
-    B = x0_latent.shape[0]
-    device = x0_latent.device
+    d = torch.randn((B, H, 6), device=device) * step_sigma
 
-    d = nominal_deltas(B, gen.horizon, angle_spec, device).detach().clone()
-    d.requires_grad_(True)
+    # Smooth in time (box filter) to avoid jitter
+    if smooth_kernel and smooth_kernel > 1:
+        k = smooth_kernel
+        pad = k // 2
+        kernel = torch.ones((1, 1, k), device=device) / float(k)
+        d_ch = d.permute(0, 2, 1).reshape(B * 6, 1, H)
+        d_sm = F.conv1d(F.pad(d_ch, (pad, pad), mode="replicate"), kernel)
+        d = d_sm.reshape(B, 6, H).permute(0, 2, 1)
 
-    opt = torch.optim.Adam([d], lr=gen.repair_lr)
+    # Apply rate limits (out-of-place, MPS friendly)
+    theta_idx = torch.tensor([0, 2, 4], device=device)
+    uphi_idx = torch.tensor([1, 3, 5], device=device)
 
-    for _ in range(gen.repair_steps):
-        # rate limits (soft via clamp-in-forward; keeps optimization stable)
-        # out-of-place clamp (MPS-friendly)
-        theta_idx = torch.tensor([0, 2, 4], device=d.device)
-        uphi_idx  = torch.tensor([1, 3, 5], device=d.device)
+    d_theta = torch.clamp(d.index_select(-1, theta_idx), -angle_spec.dtheta_max, angle_spec.dtheta_max)
+    d_uphi = torch.clamp(d.index_select(-1, uphi_idx), -angle_spec.du_phi_max, angle_spec.du_phi_max)
 
-        d_theta = torch.clamp(d.index_select(-1, theta_idx), -angle_spec.dtheta_max, angle_spec.dtheta_max)
-        d_uphi  = torch.clamp(d.index_select(-1, uphi_idx),  -angle_spec.du_phi_max, angle_spec.du_phi_max)
+    d_out = torch.empty_like(d)
+    d_out[..., 0] = d_theta[..., 0]
+    d_out[..., 2] = d_theta[..., 1]
+    d_out[..., 4] = d_theta[..., 2]
+    d_out[..., 1] = d_uphi[..., 0]
+    d_out[..., 3] = d_uphi[..., 1]
+    d_out[..., 5] = d_uphi[..., 2]
 
-        # reconstruct without in-place ops
-        d_clamped = torch.empty_like(d)
-        d_clamped[..., 0] = d_theta[..., 0]
-        d_clamped[..., 2] = d_theta[..., 1]
-        d_clamped[..., 4] = d_theta[..., 2]
-        d_clamped[..., 1] = d_uphi[..., 0]
-        d_clamped[..., 3] = d_uphi[..., 1]
-        d_clamped[..., 5] = d_uphi[..., 2]
-
-        x_lat = integrate_latents(x0_latent, d_clamped)
-        x_phys = decode_latent_to_phys(x_lat, angle_spec)
-
-        points, tip = fk_points(x_phys, points_per_segment=gen.points_per_segment)
-
-        # goal terms
-        d_tip = torch.linalg.norm(tip - goal_xyz.unsqueeze(1), dim=-1)  # (B,H)
-        goal_terminal = d_tip[:, -1] ** 2
-        goal_path = (d_tip ** 2).mean(dim=1)
-
-        # collision
-        coll = collision_loss_spheres(points, spheres, arm_radius=gen.arm_radius, sigma=gen.coll_sigma)
-
-        # smoothness
-        smooth = (d_clamped ** 2).mean(dim=(1, 2))
-        jerk = ((d_clamped[:, 1:, :] - d_clamped[:, :-1, :]) ** 2).mean(dim=(1, 2))
-
-        loss_b = (
-            gen.w_goal_terminal * goal_terminal
-            + gen.w_goal_path * goal_path
-            + gen.w_coll * coll
-            + gen.w_smooth * smooth
-            + gen.w_jerk * jerk
-        )
-        loss = loss_b.mean()
-
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
-
-    # final clamp
-    with torch.no_grad():
-        d_out = d.detach()
-        for idx in (0, 2, 4):
-            d_out[..., idx] = torch.clamp(d_out[..., idx], -angle_spec.dtheta_max, angle_spec.dtheta_max)
-        for idx in (1, 3, 5):
-            d_out[..., idx] = torch.clamp(d_out[..., idx], -angle_spec.du_phi_max, angle_spec.du_phi_max)
     return d_out
 
 
@@ -278,16 +311,21 @@ class TrajectoryChunkDataset(Dataset):
         # single-sample generation (kept simple)
         x0, goal = sample_random_start_goal_latent(1, self.angle_spec, self.device)
 
-        # nominal rollout (to place obstacles near the sweep)
-        d_nom = nominal_deltas(1, self.gen_spec.horizon, self.angle_spec, self.device)
-        x_nom_lat = integrate_latents(x0, d_nom)
-        x_nom_phys = decode_latent_to_phys(x_nom_lat, self.angle_spec)
-        pts_nom, tip_nom = fk_points(x_nom_phys, points_per_segment=self.gen_spec.points_per_segment)
+        # Fast random-walk trajectory (this is the training target distribution)
+        deltas_star = random_walk_deltas(1, self.gen_spec.horizon, self.angle_spec, self.device)
 
-        spheres = make_obstacles_adversarial(pts_nom, tip_nom, self.obs_spec, collide_prob=0.75)
+        # Roll out to get the swept arm points, then sample obstacles that DO NOT intersect the sweep.
+        x_lat = integrate_latents(x0, deltas_star)
+        x_phys = decode_latent_to_phys(x_lat, self.angle_spec)
+        pts, tip = fk_points(x_phys, points_per_segment=self.gen_spec.points_per_segment)
 
-        # repair to get training target
-        deltas_star = repair_trajectory(x0, goal, spheres, self.angle_spec, self.gen_spec)
+        spheres = sample_nonintersecting_spheres(
+            pts,
+            self.obs_spec,
+            arm_radius=self.gen_spec.arm_radius,
+            margin=max(self.gen_spec.coll_sigma, 0.01),
+            max_tries=400,
+        )
 
         return {
             "x0_latent": x0.squeeze(0),           # (6,)
