@@ -2,11 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
-
+import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from diffusers import UNet1DModel
 
@@ -91,16 +89,25 @@ class TrajectoryDeltaDiffusion(nn.Module):
             nn.Linear(128, cond_channels),
         )
 
-        # UNet1DModel expects (B, C, L)
-        # We'll concatenate conditioning channels as extra input channels
+       
+
+        min_len = 8
+        max_down = 2  # stable for horizons like 16-64 (e.g., 32 -> 16 -> 8)
+        num_down = int(math.floor(math.log2(max(horizon / float(min_len), 1.0))))
+        num_down = max(1, min(max_down, num_down))
+
+        down_block_types = ("DownBlock1D",) * num_down
+        up_block_types = ("UpBlock1D",) * num_down
+        block_out_channels = tuple([unet_base_channels] * num_down)
+
         self.unet = UNet1DModel(
             sample_size=horizon,                 # length L
             in_channels=6 + cond_channels,        # 6 delta dims + cond channels
             out_channels=6,                       # predict eps for the 6 delta dims
             layers_per_block=2,
-            block_out_channels=(unet_base_channels, unet_base_channels, unet_base_channels),
-            down_block_types=("DownBlock1D", "DownBlock1D", "DownBlock1D"),
-            up_block_types=("UpBlock1D", "UpBlock1D", "UpBlock1D"),
+            block_out_channels=block_out_channels,
+            down_block_types=down_block_types,
+            up_block_types=up_block_types,
             act_fn="silu",
         )
 

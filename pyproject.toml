@@ -10,6 +10,7 @@ dependencies = [
   "accelerate",
   "numpy",
   "tqdm",
+  "tensorboard",
 ]
 
 [project.optional-dependencies]

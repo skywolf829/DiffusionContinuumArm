@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 from dataclasses import asdict
+import contextlib
 
 import torch
 import torch.nn.functional as F
@@ -13,6 +14,9 @@ from diffusers import DDPMScheduler
 
 from model import AngleSpec, TrajectoryDeltaDiffusion
 from data import ObstacleSpec, GenSpec, TrajectoryChunkDataset
+
+from torch.utils.tensorboard import SummaryWriter
+import time
 
 
 def collate_fn(batch):
@@ -28,11 +32,11 @@ def main():
     ap.add_argument("--out", type=str, default="runs/diff_mpc")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
-    ap.add_argument("--horizon", type=int, default=20)
+    ap.add_argument("--horizon", type=int, default=32)
     ap.add_argument("--max_obs", type=int, default=4)
 
     ap.add_argument("--train_samples", type=int, default=5000)
-    ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument("--batch_size", type=int, default=1)
     ap.add_argument("--num_workers", type=int, default=0)
 
     ap.add_argument("--lr", type=float, default=2e-4)
@@ -42,6 +46,10 @@ def main():
     # data gen controls
     ap.add_argument("--repair_steps", type=int, default=120)
     ap.add_argument("--repair_lr", type=float, default=0.05)
+
+    ap.add_argument("--tb", action="store_true", help="Enable TensorBoard logging")
+    ap.add_argument("--log_every", type=int, default=1, help="Log scalars every N steps")
+    ap.add_argument("--metrics_every", type=int, default=1, help="Compute extra metrics every N steps (adds a bit of overhead)")
 
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
@@ -74,6 +82,23 @@ def main():
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
+    writer = None
+    if args.tb:
+        tb_dir = os.path.join(args.out, "tb")
+        os.makedirs(tb_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=tb_dir)
+        writer.add_text("hparams", str(vars(args)))
+    start_time = time.time()
+
+    def _sync_if_needed():
+        # Ensure accurate timing on GPU backends
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        elif device.type == "mps":
+            torch.mps.synchronize()
+
+    prev_iter_end = time.perf_counter()
+
     # save config
     with open(os.path.join(args.out, "config.txt"), "w") as f:
         f.write(str(vars(args)) + "\n")
@@ -84,11 +109,23 @@ def main():
     step = 0
     model.train()
     for epoch in range(args.epochs):
-        for batch in dl:
+        dl_iter = iter(dl)
+        while True:
+            t_data_start = time.perf_counter()
+            try:
+                batch = next(dl_iter)
+            except StopIteration:
+                break
+            data_time = time.perf_counter() - prev_iter_end
+
             x0 = batch["x0_latent"].to(device)                 # (B,6)
             goal = batch["goal_xyz"].to(device)                # (B,3)
             spheres = batch["obs_spheres"].to(device)          # (B,O,4)
             deltas = batch["deltas_latent"].to(device)         # (B,H,6)
+
+            # Start compute timing after data is on device
+            _sync_if_needed()
+            t_compute_start = time.perf_counter()
 
             B, H, D = deltas.shape
             assert H == args.horizon and D == 6
@@ -101,15 +138,60 @@ def main():
 
             eps_pred = model.forward_eps(noisy, t, x0, goal, spheres)
 
+            _sync_if_needed()
+            fwd_time = time.perf_counter() - t_compute_start
+
             loss = F.mse_loss(eps_pred, noise)
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
+
+            _sync_if_needed()
+            bwd_time = time.perf_counter() - t_compute_start - fwd_time
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
 
-            if step % 50 == 0:
-                print(f"epoch={epoch} step={step} loss={loss.item():.6f}")
+            _sync_if_needed()
+            step_time = time.perf_counter() - t_compute_start - fwd_time - bwd_time
+            total_time = time.perf_counter() - t_data_start
+            prev_iter_end = time.perf_counter()
+
+            if step % args.log_every == 0:
+                # Console
+                elapsed = time.time() - start_time
+                it_per_sec = (step + 1) / max(elapsed, 1e-9)
+                lr = opt.param_groups[0]["lr"]
+                print(
+                    f"epoch={epoch} step={step} loss={loss.item():.6f} lr={lr:.2e} it/s={it_per_sec:.2f} "
+                    f"data={data_time:.3f}s fwd={fwd_time:.3f}s bwd={bwd_time:.3f}s opt={step_time:.3f}s total={total_time:.3f}s"
+                )
+
+                # TensorBoard
+                if writer is not None:
+                    writer.add_scalar("train/loss", loss.item(), step)
+                    writer.add_scalar("train/lr", lr, step)
+                    writer.add_scalar("train/iters_per_sec", it_per_sec, step)
+                    writer.add_scalar("time/data_s", data_time, step)
+                    writer.add_scalar("time/fwd_s", fwd_time, step)
+                    writer.add_scalar("time/bwd_s", bwd_time, step)
+                    writer.add_scalar("time/opt_s", step_time, step)
+                    writer.add_scalar("time/iter_total_s", total_time, step)
+
+            if (writer is not None) and (step % args.metrics_every == 0):
+                # Simple trajectory-stat metrics (no FK required)
+                with torch.no_grad():
+                    # deltas stats
+                    writer.add_scalar("data/delta_abs_mean", deltas.abs().mean().item(), step)
+                    writer.add_scalar("data/delta_l2_mean", torch.linalg.norm(deltas, dim=-1).mean().item(), step)
+
+                    if deltas.shape[1] > 1:
+                        jerk = (deltas[:, 1:, :] - deltas[:, :-1, :]).pow(2).mean().item()
+                        writer.add_scalar("data/jerk_mse", jerk, step)
+
+                    # noise prediction quality summary
+                    # (correlation-ish proxy: mse already logged; log mean abs error too)
+                    writer.add_scalar("train/eps_abs_err_mean", (eps_pred - noise).abs().mean().item(), step)
 
             if step % 500 == 0 and step > 0:
                 ckpt = {
@@ -126,6 +208,9 @@ def main():
             step += 1
 
     torch.save({"model": model.state_dict(), "args": vars(args)}, os.path.join(args.out, "final.pt"))
+    if writer is not None:
+        writer.flush()
+        writer.close()
     print("Done. Saved:", os.path.join(args.out, "final.pt"))
 
 

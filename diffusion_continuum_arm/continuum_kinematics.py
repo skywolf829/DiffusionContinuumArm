@@ -1,7 +1,6 @@
 import numpy as np
 def kinematics(phi, theta,xi):
 	L = 0.15
-	r=0.0125
 	res = np.zeros((4,4))
 	res[0,0]= 1 + xi ** 12 * phi ** 12 / 479001600 + (theta ** 2 - 1) * xi ** 10 * phi ** 10 / 3628800 + xi ** 8 * (theta ** 4 - 3 * theta ** 2 + 3) * phi ** 8 / 120960 + xi ** 6 * (theta ** 6 - 0.15e2 / 0.2e1 * theta ** 4 + 0.45e2 / 0.2e1 * theta ** 2 - 0.45e2 / 0.2e1) * phi ** 6 / 16200 + xi ** 4 * (theta ** 8 - 14 * theta ** 6 + 105 * theta ** 4 - 315 * theta ** 2 + 315) * phi ** 4 / 7560 + (theta ** 10 - 0.45e2 / 0.2e1 * theta ** 8 + 315 * theta ** 6 - 0.4725e4 / 0.2e1 * theta ** 4 + 0.14175e5 / 0.2e1 * theta ** 2 - 0.14175e5 / 0.2e1) * xi ** 2 * phi ** 2 / 14175
 	res[0,1]= -xi ** 2 * theta * phi ** 2 * (xi ** 8 * phi ** 8 + 60 * phi ** 6 * theta ** 2 * xi ** 6 - 90 * phi ** 6 * xi ** 6 + 672 * phi ** 4 * theta ** 4 * xi ** 4 - 3360 * phi ** 4 * theta ** 2 * xi ** 4 + 1920 * phi ** 2 * theta ** 6 * xi ** 2 + 5040 * phi ** 4 * xi ** 4 - 20160 * phi ** 2 * theta ** 4 * xi ** 2 + 1280 * theta ** 8 + 100800 * phi ** 2 * theta ** 2 * xi ** 2 - 23040 * theta ** 6 - 151200 * phi ** 2 * xi ** 2 + 241920 * theta ** 4 - 1209600 * theta ** 2 + 1814400) / 3628800

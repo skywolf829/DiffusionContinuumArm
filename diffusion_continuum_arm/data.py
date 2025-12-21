@@ -48,7 +48,7 @@ def collision_loss_spheres(points: torch.Tensor, spheres: torch.Tensor, arm_radi
     returns scalar loss per batch: (B,)
     """
     B, T, P, _ = points.shape
-    O = spheres.shape[1]
+    spheres.shape[1]
 
     c = spheres[..., :3]  # (B,O,3)
     r = spheres[..., 3:4] # (B,O,1)
@@ -157,14 +157,9 @@ def nominal_deltas(B: int, H: int, angle_spec: AngleSpec, device: torch.device) 
 def integrate_latents(x0_latent: torch.Tensor, deltas: torch.Tensor) -> torch.Tensor:
     """
     x0_latent: (B,6), deltas:(B,H,6) => x_latent:(B,H,6)
+    Safe autograd version (no in-place writes).
     """
-    B, H, D = deltas.shape
-    x = torch.zeros((B, H, D), device=deltas.device, dtype=deltas.dtype)
-    prev = x0_latent
-    for t in range(H):
-        prev = prev + deltas[:, t, :]
-        x[:, t, :] = prev
-    return x
+    return x0_latent.unsqueeze(1) + torch.cumsum(deltas, dim=1)
 
 
 def decode_latent_to_phys(x_latent: torch.Tensor, angle_spec: AngleSpec) -> torch.Tensor:
@@ -201,11 +196,21 @@ def repair_trajectory(
 
     for _ in range(gen.repair_steps):
         # rate limits (soft via clamp-in-forward; keeps optimization stable)
-        d_clamped = d.clone()
-        for idx in (0, 2, 4):
-            d_clamped[..., idx] = torch.clamp(d_clamped[..., idx], -angle_spec.dtheta_max, angle_spec.dtheta_max)
-        for idx in (1, 3, 5):
-            d_clamped[..., idx] = torch.clamp(d_clamped[..., idx], -angle_spec.du_phi_max, angle_spec.du_phi_max)
+        # out-of-place clamp (MPS-friendly)
+        theta_idx = torch.tensor([0, 2, 4], device=d.device)
+        uphi_idx  = torch.tensor([1, 3, 5], device=d.device)
+
+        d_theta = torch.clamp(d.index_select(-1, theta_idx), -angle_spec.dtheta_max, angle_spec.dtheta_max)
+        d_uphi  = torch.clamp(d.index_select(-1, uphi_idx),  -angle_spec.du_phi_max, angle_spec.du_phi_max)
+
+        # reconstruct without in-place ops
+        d_clamped = torch.empty_like(d)
+        d_clamped[..., 0] = d_theta[..., 0]
+        d_clamped[..., 2] = d_theta[..., 1]
+        d_clamped[..., 4] = d_theta[..., 2]
+        d_clamped[..., 1] = d_uphi[..., 0]
+        d_clamped[..., 3] = d_uphi[..., 1]
+        d_clamped[..., 5] = d_uphi[..., 2]
 
         x_lat = integrate_latents(x0_latent, d_clamped)
         x_phys = decode_latent_to_phys(x_lat, angle_spec)
