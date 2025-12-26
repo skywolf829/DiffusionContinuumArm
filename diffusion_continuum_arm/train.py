@@ -5,15 +5,25 @@ import argparse
 import os
 from dataclasses import asdict
 import contextlib
+import math
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from diffusers import DDPMScheduler
+from diffusers import DDPMScheduler, DDIMScheduler
 
 from model import AngleSpec, TrajectoryDeltaDiffusion
-from data import ObstacleSpec, GenSpec, TrajectoryChunkDataset
+from data import (
+    ObstacleSpec,
+    GenSpec,
+    TrajectoryChunkDataset,
+    integrate_latents,
+    decode_latent_to_phys,
+    fk_points,
+    collision_loss_spheres,
+    min_clearance_to_spheres,
+)
 
 from torch.utils.tensorboard import SummaryWriter
 import time
@@ -51,6 +61,11 @@ def main():
     ap.add_argument("--log_every", type=int, default=1, help="Log scalars every N steps")
     ap.add_argument("--metrics_every", type=int, default=1, help="Compute extra metrics every N steps (adds a bit of overhead)")
 
+    ap.add_argument("--warmup_steps", type=int, default=200, help="Linear warmup steps for LR scheduler")
+    ap.add_argument("--min_lr_frac", type=float, default=0.05, help="Cosine decay final LR as fraction of base LR")
+    ap.add_argument("--val_every", type=int, default=50, help="Run validation sampling every N train steps")
+    ap.add_argument("--val_ddim_steps", type=int, default=30, help="DDIM steps for validation sampling")
+
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -69,6 +84,9 @@ def main():
     )
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate_fn)
 
+    steps_per_epoch = math.ceil(args.train_samples / max(args.batch_size, 1))
+    total_train_steps = args.epochs * steps_per_epoch
+
     model = TrajectoryDeltaDiffusion(
         horizon=args.horizon,
         max_obs=args.max_obs,
@@ -81,6 +99,37 @@ def main():
     noise_scheduler = DDPMScheduler(num_train_timesteps=args.diffusion_steps)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    # LR scheduler: linear warmup -> cosine decay
+    warmup_steps = max(0, min(args.warmup_steps, total_train_steps))
+    cosine_steps = max(1, total_train_steps - warmup_steps)
+
+    sched_warmup = torch.optim.lr_scheduler.LinearLR(
+        opt,
+        start_factor=0.1,
+        end_factor=1.0,
+        total_iters=max(1, warmup_steps),
+    )
+    sched_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt,
+        T_max=cosine_steps,
+        eta_min=args.lr * args.min_lr_frac,
+    )
+
+    if warmup_steps > 0:
+        lr_sched = torch.optim.lr_scheduler.SequentialLR(
+            opt,
+            schedulers=[sched_warmup, sched_cosine],
+            milestones=[warmup_steps],
+        )
+    else:
+        lr_sched = sched_cosine
+
+    ddim_scheduler = DDIMScheduler(
+        num_train_timesteps=args.diffusion_steps,
+        prediction_type="epsilon",
+        clip_sample=False,
+    )
 
     writer = None
     if args.tb:
@@ -97,6 +146,24 @@ def main():
         elif device.type == "mps":
             torch.mps.synchronize()
 
+    @torch.no_grad()
+    def _ddim_sample_one(x0_latent: torch.Tensor, goal_xyz: torch.Tensor, spheres: torch.Tensor) -> torch.Tensor:
+        """Return sampled deltas: (1,H,6) using DDIM."""
+        B = x0_latent.shape[0]
+        H = args.horizon
+        sample = torch.randn((B, H, 6), device=device)
+
+        ddim_scheduler.set_timesteps(args.val_ddim_steps, device=device)
+        for t_step in ddim_scheduler.timesteps:
+            tt = torch.full((B,), int(t_step), device=device, dtype=torch.long)
+            eps = model.forward_eps(sample, tt, x0_latent, goal_xyz, spheres)
+            out = ddim_scheduler.step(eps, t_step, sample)
+            sample = out.prev_sample
+
+        # Rate-limit clamp for plausibility
+        sample = model.clamp_deltas(sample)
+        return sample
+
     prev_iter_end = time.perf_counter()
 
     # save config
@@ -105,6 +172,19 @@ def main():
         f.write("angle=" + str(asdict(angle)) + "\n")
         f.write("obs=" + str(asdict(obs)) + "\n")
         f.write("gen=" + str(asdict(gen)) + "\n")
+
+    # Fixed validation scene (deterministic)
+    val_scene = None
+    torch.manual_seed(1234)
+    try:
+        val_scene = ds[0]
+    finally:
+        # Do not disturb training randomness too much; user can set global seeds if desired.
+        pass
+
+    val_x0 = val_scene["x0_latent"].unsqueeze(0).to(device)
+    val_goal = val_scene["goal_xyz"].unsqueeze(0).to(device)
+    val_spheres = val_scene["obs_spheres"].unsqueeze(0).to(device)
 
     step = 0
     model.train()
@@ -152,6 +232,8 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
 
+            lr_sched.step()
+
             _sync_if_needed()
             step_time = time.perf_counter() - t_compute_start - fwd_time - bwd_time
             total_time = time.perf_counter() - t_data_start
@@ -192,6 +274,34 @@ def main():
                     # noise prediction quality summary
                     # (correlation-ish proxy: mse already logged; log mean abs error too)
                     writer.add_scalar("train/eps_abs_err_mean", (eps_pred - noise).abs().mean().item(), step)
+
+            # Validation: full diffusion sampling pass on a fixed scene
+            if (writer is not None) and (step % args.val_every == 0):
+                model.eval()
+                _sync_if_needed()
+                t0 = time.perf_counter()
+
+                deltas_samp = _ddim_sample_one(val_x0, val_goal, val_spheres)  # (1,H,6)
+
+                _sync_if_needed()
+                t_sample = time.perf_counter() - t0
+
+                # Rollout + physical metrics
+                x_lat = integrate_latents(val_x0, deltas_samp)                 # (1,H,6)
+                x_phys = decode_latent_to_phys(x_lat, angle)                   # (1,H,6)
+                pts, tip = fk_points(x_phys, points_per_segment=gen.points_per_segment)
+
+                tip_dist = torch.linalg.norm(tip[:, -1, :] - val_goal, dim=-1).mean().item()
+                coll = collision_loss_spheres(pts, val_spheres, arm_radius=gen.arm_radius, sigma=gen.coll_sigma).item()
+                clearance = min_clearance_to_spheres(pts, val_spheres, arm_radius=gen.arm_radius)
+                min_clear = clearance.min(dim=1).values.mean().item()  # average over batch
+
+                writer.add_scalar("val/ddim_sample_time_s", t_sample, step)
+                writer.add_scalar("val/tip_dist_m", tip_dist, step)
+                writer.add_scalar("val/collision_loss", coll, step)
+                writer.add_scalar("val/min_clearance_m", min_clear, step)
+
+                model.train()
 
             if step % 500 == 0 and step > 0:
                 ckpt = {
